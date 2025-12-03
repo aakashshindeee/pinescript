@@ -1,0 +1,161 @@
+//@version=6
+strategy("4 EMA Crossover — MTF + Trailing Profit (V6)",
+     overlay=true,
+     initial_capital=100000,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=100,
+     commission_type=strategy.commission.percent,
+     commission_value=0.0,
+     pyramiding=0)
+
+// --- 1. EMA & Risk Inputs ---
+len1 = input.int(8, minval=1, title="MA1")
+len2 = input.int(13, minval=1, title="MA2")
+len3 = input.int(21, minval=1, title="MA3")
+len4 = input.int(55, minval=1, title="MA4")
+
+// HTF Confirmation Inputs
+htf_timeframe = input.timeframe("60", title="Higher Timeframe (HTF) for Trend")
+htf_slow_len = input.int(200, minval=1, title="HTF EMA 200 Length")
+
+// Standard Filters
+rsiPeriod = input.int(14, minval=1, title="RSI Period")
+atrPeriod = input.int(14, minval=1, title="ATR Period")
+atrSidewaysMultiplier = input.float(1.5, minval=0.1, step=0.1, title="ATR Sideways Filter Multiplier") 
+
+// --- PROFIT OPTIMIZATION INPUTS ---
+use_trailing = input.bool(true, title="Use ATR Trailing Stop instead of Fixed TP?")
+atrStopMultiplier = input.float(1.5, minval=0.1, step=0.1, title="Stop Loss / Trail Distance (ATR)") 
+atrTargetMultiplier = input.float(4.5, minval=0.1, step=0.1, title="Fixed TP Multiplier (Only if Trailing is OFF)") 
+use_rsi_exit = input.bool(true, title="Exit on RSI Exhaustion (Overbought/Oversold)?")
+rsi_exit_level = input.int(80, title="RSI Exhaustion Level (80/-20)")
+
+
+// --- 2. Indicators & HTF Confirmation ---
+// Current Timeframe (15m) EMAs
+ma1 = ta.ema(close, len1)
+ma2 = ta.ema(close, len2)
+ma3 = ta.ema(close, len3)
+ma4 = ta.ema(close, len4) // 55 EMA
+
+// Higher Timeframe (HTF) EMAs
+// Using syminfo.tickerid is standard in V6, but ensure no chart replays conflict
+htf_ma55 = request.security(syminfo.tickerid, htf_timeframe, ta.ema(close, 55))
+htf_ma200 = request.security(syminfo.tickerid, htf_timeframe, ta.ema(close, htf_slow_len))
+
+// HTF Trend Confirmation
+htf_long_trend = htf_ma55 > htf_ma200
+htf_short_trend = htf_ma55 < htf_ma200
+
+// Momentum & Volatility Filters
+rsiValue = ta.rsi(close, rsiPeriod)
+atrValue = ta.atr(atrPeriod)
+isSideways = (ta.highest(high, 10) - ta.lowest(low, 10)) < (atrValue * atrSidewaysMultiplier)
+longMomentumCond = rsiValue > 50
+shortMomentumCond = rsiValue < 50
+
+
+// --- 3. Crossover & Filtered Signals ---
+longCond = ma1 > ma4 and ma2 > ma4 and ma3 > ma4 and longMomentumCond and not isSideways and htf_long_trend
+shortCond = ma1 < ma4 and ma2 < ma4 and ma3 < ma4 and shortMomentumCond and not isSideways and htf_short_trend
+
+// State machine
+var int CondIni = 0
+CondIni := longCond ? 1 : shortCond ? -1 : CondIni[1]
+
+longSignal = longCond and CondIni[1] == -1
+shortSignal = shortCond and CondIni[1] == 1
+
+
+// --- 4. Strategy Orders ---
+if longSignal
+    strategy.entry("Long", strategy.long)
+else if shortSignal
+    strategy.entry("Short", strategy.short)
+
+
+// --- 5. TRAILING STOP & EXIT LOGIC ---
+
+// Save the ATR at the moment of entry so the stop distance doesn't fluctuate wildly
+var float tradeAtr = na
+if longSignal or shortSignal
+    tradeAtr := atrValue
+
+// Calculate the base Stop Loss distance
+slDistance = tradeAtr * atrStopMultiplier
+
+// Trailing Logic Variables
+var float longTrailPrice = na
+var float shortTrailPrice = na
+
+// Update Trailing Stop for LONG
+if strategy.position_size > 0
+    // Calculate potential new stop level (Current High - ATR Distance)
+    float potentialStop = high - slDistance
+    
+    // If we just entered, set the stop. Otherwise, move it UP only.
+    if na(longTrailPrice) 
+        longTrailPrice := potentialStop
+    else
+        longTrailPrice := math.max(longTrailPrice, potentialStop)
+else
+    longTrailPrice := na
+
+// Update Trailing Stop for SHORT
+if strategy.position_size < 0
+    // Calculate potential new stop level (Current Low + ATR Distance)
+    float potentialStop = low + slDistance
+    
+    // If we just entered, set the stop. Otherwise, move it DOWN only.
+    if na(shortTrailPrice)
+        shortTrailPrice := potentialStop
+    else
+        shortTrailPrice := math.min(shortTrailPrice, potentialStop)
+else
+    shortTrailPrice := na
+
+
+// --- 6. EXECUTE EXITS ---
+
+// Option A: TRAILING STOP MODE
+if use_trailing
+    if strategy.position_size > 0
+        strategy.exit("Trail Long", "Long", stop=longTrailPrice, comment="Trailing SL")
+    if strategy.position_size < 0
+        strategy.exit("Trail Short", "Short", stop=shortTrailPrice, comment="Trailing SL")
+
+// Option B: FIXED TARGET MODE (Old behavior)
+else
+    longStopPrice = strategy.position_avg_price - slDistance
+    longTargetPrice = strategy.position_avg_price + (tradeAtr * atrTargetMultiplier)
+    shortStopPrice = strategy.position_avg_price + slDistance
+    shortTargetPrice = strategy.position_avg_price - (tradeAtr * atrTargetMultiplier)
+    
+    strategy.exit("Fixed Long", "Long", stop=longStopPrice, limit=longTargetPrice)
+    strategy.exit("Fixed Short", "Short", stop=shortStopPrice, limit=shortTargetPrice)
+
+// Option C: RSI EXHAUSTION EXIT (Bonus Information)
+// 
+
+[Image of Relative Strength Index (RSI) indicator with 50 level]
+ 
+// If RSI goes too high (Overbought) while Long, close the trade to secure peak profit.
+if use_rsi_exit
+    if strategy.position_size > 0 and rsiValue > rsi_exit_level
+        strategy.close("Long", comment="RSI Overbought")
+    if strategy.position_size < 0 and rsiValue < (100 - rsi_exit_level)
+        strategy.close("Short", comment="RSI Oversold")
+
+
+// --- 7. Plots ---
+plot(ma1, title="MA1 (8)", color=color.blue)
+plot(ma2, title="MA2 (13)", color=color.red)
+plot(ma3, title="MA3 (21)", color=color.green)
+plot(ma4, title="MA4 (55)", color=color.orange)
+
+// Plot the Trailing Stop Line for visual confirmation
+plot(strategy.position_size > 0 ? longTrailPrice : na, title="Long Trail SL", color=color.red, style=plot.style_linebr)
+plot(strategy.position_size < 0 ? shortTrailPrice : na, title="Short Trail SL", color=color.red, style=plot.style_linebr)
+
+plotshape(longSignal, title="Buy Signal", text="B", textcolor=color.white, style=shape.labelup, size=size.tiny, location=location.belowbar, color=color.new(color.green, 0))
+plotshape(shortSignal, title="Sell Signal", text="S", textcolor=color.white, style=shape.labeldown, size=size.tiny, location=location.abovebar, color=color.new(color.red, 0))
